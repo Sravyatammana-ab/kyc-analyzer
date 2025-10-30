@@ -1,0 +1,9 @@
+This is a test invoice document.
+
+Invoice Number: INV-001
+Date: 2024-01-15
+Customer: John Doe
+Amount: $500.00
+Description: Web Development Services
+
+Thank you for your business!

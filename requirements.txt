@@ -5,10 +5,11 @@ gunicorn
 python-multipart
 streamlit
 requests
-google-generativeai
+openai
 python-dotenv
 pdfplumber
 openpyxl
 python-docx
 pandas
 pillow
+pytesseract

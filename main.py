@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import textract_service
-import gemini_service
+import openai_service
 
 # Load environment variables from .env file
 load_dotenv()
@@ -16,12 +16,15 @@ load_dotenv()
 app = FastAPI(title="Document Analysis API")
 logging.basicConfig(level=logging.INFO)
 
-# Configure CORS for development (restrict in production)
+# Configure CORS (use env var FRONTEND_ORIGINS for production, comma-separated)
+frontend_origins = os.getenv("FRONTEND_ORIGINS", "*")
+allow_origins = [o.strip() for o in frontend_origins.split(",")] if frontend_origins else ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Use ["https://yourfrontend.com"] in production
+    allow_origins=allow_origins,
     allow_credentials=True,
-    allow_methods=["POST", "GET"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -63,7 +66,7 @@ async def analyze(file: UploadFile = File(...)):
             tmp.write(file_bytes)
             tmp_path = tmp.name
 
-        # 1. Extract text using the hybrid service
+        # 1. Extract text using pdfplumber and Tesseract OCR
         logging.info(f"Processing file: {file.filename}, content_type: {file.content_type}")
         extracted_text = await textract_service.extract_text_from_upload(
             tmp_path,
@@ -74,25 +77,28 @@ async def analyze(file: UploadFile = File(...)):
         if not extracted_text or not extracted_text.strip():
             raise HTTPException(
                 status_code=422, 
-                detail="Failed to extract text from document. Check if GEMINI_API_KEY is set and file is readable."
+                detail="Failed to extract text from document. Please check if the document is readable and Tesseract OCR is installed."
             )
 
-        # 2. Classify the document type
-        classification_result = await gemini_service.classify_document(extracted_text)
+        # 2. Classify the KYC document type
+        logging.info(f"Extracted text preview: {extracted_text[:300]}...")
+        classification_result = await openai_service.classify_document(extracted_text)
         logging.info(f"classification_result type: {type(classification_result)}, value: {classification_result}")
         if not isinstance(classification_result, dict):
             classification_result = {"document_type": str(classification_result)}
         doc_type = classification_result.get("document_type", "GeneralDocument")
+        logging.info(f"Document classified as: {doc_type}")
 
-        # 3. Perform specialized analysis
-        analysis_result = await gemini_service.analyze_document_by_type(extracted_text, doc_type)
+        # 3. Perform specialized KYC analysis
+        logging.info(f"Proceeding with analysis for document type: {doc_type}")
+        analysis_result = await openai_service.analyze_document_by_type(extracted_text, doc_type)
         
-        # ✅ Ensure analysis_result is a dictionary
+        # Ensure analysis_result is a dictionary
         if not isinstance(analysis_result, dict):
             logging.warning("OpenAI returned non-dict analysis result. Wrapping it.")
             analysis_result = {"analysis_output": str(analysis_result)}
 
-        # ✅ Optional debug logging
+        # Optional debug logging
         logging.info(f"analysis_result type: {type(analysis_result)}, value: {analysis_result}")
 
         return {

@@ -105,13 +105,36 @@ async def extract_text_from_file(file_path: str, file_bytes: bytes, mime_type: O
     model = _get_model()
 
     def _upload_and_generate():
-        uploaded = genai.upload_file(path=file_path, mime_type=mime_type) if file_path else genai.upload_file(bytes=file_bytes, mime_type=mime_type)
-        prompt = (
-            "Extract the plain textual content from the provided file. "
-            "Return ONLY the extracted text with no additional commentary."
-        )
-        resp = model.generate_content([prompt, uploaded])
-        return (resp.text or "").strip()
+        # For images, use direct content generation instead of file upload
+        if file_bytes and mime_type and mime_type.startswith('image/'):
+            from io import BytesIO
+            from PIL import Image
+            try:
+                # Convert bytes to PIL Image
+                image = Image.open(BytesIO(file_bytes))
+                prompt = (
+                    "Extract the plain textual content from this image. "
+                    "Return ONLY the extracted text with no additional commentary."
+                )
+                resp = model.generate_content([prompt, image])
+                return (resp.text or "").strip()
+            except Exception as e:
+                logging.error(f"Error processing image with PIL: {e}")
+                return ""
+        else:
+            # For other file types, use file upload
+            if file_bytes:
+                from io import BytesIO
+                file_obj = BytesIO(file_bytes)
+                uploaded = genai.upload_file(path=file_obj, mime_type=mime_type)
+            else:
+                uploaded = genai.upload_file(path=file_path, mime_type=mime_type)
+            prompt = (
+                "Extract the plain textual content from the provided file. "
+                "Return ONLY the extracted text with no additional commentary."
+            )
+            resp = model.generate_content([prompt, uploaded])
+            return (resp.text or "").strip()
 
     try:
         text = await _run_blocking(_upload_and_generate)
