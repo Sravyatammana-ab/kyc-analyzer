@@ -10,6 +10,7 @@ from docx import Document
 from PIL import Image
 from io import BytesIO
 from mimetypes import guess_type
+import time
 
 try:
     import pytesseract
@@ -19,6 +20,9 @@ except ImportError:
     logging.warning("pytesseract not installed. OCR functionality will be limited.")
 
 load_dotenv()
+
+# Configure a hard ceiling for OCR processing latency (seconds)
+MAX_OCR_SECONDS = int(os.getenv("MAX_OCR_SECONDS", "55"))
 
 # Configure Tesseract path (update this if Tesseract is installed in a different location)
 # For Windows, common path: r'C:\\Program Files\\Tesseract-OCR\\tesseract.exe'
@@ -61,18 +65,22 @@ if TESSERACT_AVAILABLE:
                 logging.info(f"Set TESSDATA_PREFIX to: {candidate}")
                 break
 
-
 async def extract_text_from_upload(file_path: str, file_bytes: bytes, mime_type_hint: str = None) -> str:
     """Extracts text from various formats. Uses Tesseract OCR for images and scanned documents."""
 
     ext = file_path.lower()
     logging.info(f"extract_text_from_upload called: file_path={file_path}, mime_type={mime_type_hint}, file_size={len(file_bytes)} bytes")
-    
+
+    start_time = time.monotonic()
+
     # Log Tesseract status
     if TESSERACT_AVAILABLE:
         logging.info(f"Tesseract available: True, Path: {getattr(pytesseract.pytesseract, 'tesseract_cmd', 'Not configured')}")
     else:
         logging.warning("Tesseract NOT available - pytesseract not installed")
+
+    def deadline_exceeded() -> bool:
+        return (time.monotonic() - start_time) > MAX_OCR_SECONDS
 
     # 1. Extract text from digital PDFs
     if ext.endswith(".pdf"):
@@ -84,17 +92,19 @@ async def extract_text_from_upload(file_path: str, file_bytes: bytes, mime_type_
                 return full_text.strip()
         except Exception as e:
             logging.warning(f"pdfplumber failed: {e}. Falling back to Tesseract OCR.")
-        
-        # Fallback to Tesseract for scanned PDFs
-        if TESSERACT_AVAILABLE:
+
+        # Fallback to Tesseract for scanned PDFs (limited pages to honor deadline)
+        if TESSERACT_AVAILABLE and not deadline_exceeded():
             try:
                 logging.info("Attempting Tesseract OCR on PDF pages...")
                 with pdfplumber.open(BytesIO(file_bytes)) as pdf:
                     extracted_text = []
-                    for page_num, page in enumerate(pdf.pages[:5]):  # Limit to first 5 pages
+                    for page_num, page in enumerate(pdf.pages[:2]):  # limit to first 2 pages for latency
+                        if deadline_exceeded():
+                            break
                         try:
                             image = page.to_image(resolution=200)
-                            text = pytesseract.image_to_string(image.original)
+                            text = pytesseract.image_to_string(image.original, lang='eng')
                             if text.strip():
                                 extracted_text.append(text.strip())
                         except Exception as e:
@@ -106,7 +116,7 @@ async def extract_text_from_upload(file_path: str, file_bytes: bytes, mime_type_
             except Exception as e:
                 logging.error(f"Tesseract OCR on PDF failed: {e}")
         else:
-            logging.warning("Tesseract not available. Cannot perform OCR on scanned PDF.")
+            logging.warning("Tesseract not available or deadline exceeded. Cannot perform OCR on scanned PDF.")
 
     # 2. Extract text from Word documents (.docx)
     elif ext.endswith(".docx"):
@@ -148,13 +158,12 @@ async def extract_text_from_upload(file_path: str, file_bytes: bytes, mime_type_
         if not TESSERACT_AVAILABLE:
             logging.error("Tesseract OCR not available. Cannot process images.")
             return ""
-        
+
         try:
             logging.info("Extracting text from image using Tesseract OCR...")
-            
-            # Ensure Tesseract path is configured
+
+            # Ensure Tesseract path is configured (retry)
             if not hasattr(pytesseract.pytesseract, 'tesseract_cmd') or not pytesseract.pytesseract.tesseract_cmd:
-                # Re-detect from env or PATH (Docker/Linux)
                 retry_cmd = os.getenv("TESSERACT_CMD")
                 if not retry_cmd:
                     try:
@@ -165,12 +174,8 @@ async def extract_text_from_upload(file_path: str, file_bytes: bytes, mime_type_
                 if retry_cmd and os.path.exists(retry_cmd):
                     pytesseract.pytesseract.tesseract_cmd = retry_cmd
                     logging.info(f"Configured Tesseract path: {retry_cmd}")
-                # Ensure TESSDATA_PREFIX is set if available
                 if 'TESSDATA_PREFIX' not in os.environ:
-                    for candidate in [
-                        '/usr/share/tesseract-ocr/4.00/tessdata',
-                        '/usr/share/tesseract-ocr/tessdata'
-                    ]:
+                    for candidate in ['/usr/share/tesseract-ocr/4.00/tessdata','/usr/share/tesseract-ocr/tessdata']:
                         if os.path.exists(candidate):
                             os.environ['TESSDATA_PREFIX'] = candidate
                             logging.info(f"Set TESSDATA_PREFIX to: {candidate}")
@@ -178,196 +183,60 @@ async def extract_text_from_upload(file_path: str, file_bytes: bytes, mime_type_
 
             image = Image.open(BytesIO(file_bytes))
             logging.info(f"Loaded image: mode={image.mode}, size={image.size}")
-            
-            # Store original image for comparison
+
             original_image = image.copy()
-            
-            # Try OCR with multiple preprocessing techniques
-            from PIL import ImageEnhance, ImageFilter, ImageOps
+
+            from PIL import ImageEnhance, ImageFilter
             text = ""
             successful_config = None
-            all_texts = []  # Collect all OCR results
-            
-            # Strategy 1: No preprocessing (original image)
-            logging.info("Strategy 1: Trying OCR without preprocessing...")
-            try:
-                text = pytesseract.image_to_string(original_image, lang='eng')
-                if text.strip():
-                    logging.info(f"Strategy 1 succeeded! Extracted {len(text)} characters")
-                    logging.info(f"First 300 chars: {text[:300]}")
-                    all_texts.append(("no_preprocessing", text.strip()))
-            except Exception as e:
-                logging.warning(f"Strategy 1 failed: {e}")
-            
-            # Strategy 2: Enhanced preprocessing for better text extraction
-            logging.info("Strategy 2: Trying with enhanced preprocessing...")
-            try:
-                # Convert to RGB if needed (some images may have different modes)
-                if original_image.mode != 'RGB':
-                    processed_image = original_image.convert('RGB')
-                else:
-                    processed_image = original_image.copy()
-                
-                # Convert to grayscale for better OCR
-                if processed_image.mode != 'L':
-                    processed_image = processed_image.convert('L')
-                    logging.info("Converted to grayscale")
-                
-                # Apply multiple sharpening passes for better edge definition
-                processed_image = processed_image.filter(ImageFilter.SHARPEN)
-                processed_image = processed_image.filter(ImageFilter.SHARPEN)
-                logging.info("Applied double sharpening filter")
-                
-                # Very strong contrast boost for faint text
-                enhancer = ImageEnhance.Contrast(processed_image)
-                processed_image = enhancer.enhance(3.0)  # Increased from 2.0 to 3.0
-                logging.info("Applied very strong contrast boost (3.0x)")
-                
-                # Enhanced brightness for visibility
-                enhancer = ImageEnhance.Brightness(processed_image)
-                processed_image = enhancer.enhance(1.3)  # Increased from 1.2 to 1.3
-                logging.info("Applied enhanced brightness boost")
-                
-                # Resize for better OCR quality (minimum 1500px on smallest side - increased)
-                width, height = processed_image.size
-                if min(width, height) < 1500:
-                    scale = 1500 / min(width, height)
-                    new_width = int(width * scale)
-                    new_height = int(height * scale)
-                    processed_image = processed_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                    logging.info(f"Resized to {new_width}x{new_height}")
-                
-                # Try OCR with multiple configs - more configs for better date extraction
-                configs_to_try = [
-                    '--oem 3 --psm 3',  # Fully automatic page segmentation (best for complex layouts)
-                    '--oem 3 --psm 6',  # Uniform block of text
-                    '--oem 3 --psm 11', # Sparse text (good for forms)
-                    '--oem 3 --psm 4',  # Single column
-                    '--oem 3 --psm 12', # Sparse text with OSD
-                    '--oem 3 --psm 1',  # Automatic with OSD
-                    '--oem 3 --psm 0',  # Orientation and script detection
-                ]
-                
-                for config in configs_to_try:
-                    try:
-                        temp_text = pytesseract.image_to_string(processed_image, lang='eng', config=config)
-                        if temp_text.strip():
-                            logging.info(f"Strategy 2 succeeded with config '{config}'! Extracted {len(temp_text)} characters")
-                            all_texts.append(("enhanced_preprocessing_" + config, temp_text.strip()))
-                            if not text.strip() or len(temp_text) > len(text):
-                                text = temp_text
-                                successful_config = f"enhanced_preprocessing with {config}"
-                    except Exception as e:
-                        logging.debug(f"Config '{config}' failed: {e}")
-            except Exception as e:
-                logging.warning(f"Strategy 2 failed: {e}")
-            
-            # Strategy 3: Aggressive preprocessing for difficult documents
-            logging.info("Strategy 3: Trying aggressive preprocessing...")
-            try:
-                # Start with original image
-                if original_image.mode != 'RGB':
-                    aggr_image = original_image.convert('RGB')
-                else:
-                    aggr_image = original_image.copy()
-                
-                # Convert to grayscale
-                if aggr_image.mode != 'L':
-                    aggr_image = aggr_image.convert('L')
-                
-                # Multiple sharpening passes for faint text
-                aggr_image = aggr_image.filter(ImageFilter.SHARPEN)
-                aggr_image = aggr_image.filter(ImageFilter.SHARPEN)
-                logging.info("Applied double sharpening")
-                
-                # Extremely aggressive contrast for very faint/worn documents
-                enhancer = ImageEnhance.Contrast(aggr_image)
-                aggr_image = enhancer.enhance(4.0)  # Increased from 3.0 to 4.0
-                logging.info("Applied extremely aggressive contrast enhancement (4.0x)")
-                
-                # Enhanced brightness
-                enhancer = ImageEnhance.Brightness(aggr_image)
-                aggr_image = enhancer.enhance(1.4)
-                logging.info("Applied enhanced brightness boost")
-                
-                # Apply Unsharp Mask for better text clarity
-                aggr_image = aggr_image.filter(ImageFilter.UnsharpMask(radius=3, percent=200, threshold=3))
-                logging.info("Applied strong unsharp mask")
-                
-                # Resize aggressively for maximum quality
-                width, height = aggr_image.size
-                if min(width, height) < 2000:
-                    scale = 2000 / min(width, height)
-                    new_width = int(width * scale)
-                    new_height = int(height * scale)
-                    aggr_image = aggr_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                    logging.info(f"Resized aggressively to {new_width}x{new_height}")
-                
-                # Try with different OCR configs
-                for config in ['--oem 3 --psm 6', '--oem 3 --psm 11', '--oem 3 --psm 3']:
-                    try:
-                        temp_text = pytesseract.image_to_string(aggr_image, lang='eng', config=config)
-                        if temp_text.strip():
-                            logging.info(f"Strategy 3 succeeded with config '{config}'! Extracted {len(temp_text)} characters")
-                            all_texts.append(("aggressive_preprocessing_" + config, temp_text.strip()))
-                            if not text.strip() or len(temp_text) > len(text):
-                                text = temp_text
-                                successful_config = f"aggressive_preprocessing with {config}"
-                    except Exception as e:
-                        logging.debug(f"Aggressive preprocessing with {config} failed: {e}")
-            except Exception as e:
-                logging.warning(f"Strategy 3 failed: {e}")
-            
-            # Strategy 4: Try with multi-language support (Hindi + English for Indian documents)
-            logging.info("Strategy 4: Trying multi-language OCR (Hindi+English)...")
-            try:
-                # Use the best preprocessed image we have
-                if 'processed_image' in locals():
-                    test_image = processed_image
-                else:
-                    test_image = original_image
-                    if test_image.mode != 'L':
-                        test_image = test_image.convert('L')
-                
-                languages_to_try = ['hin+eng', 'eng+hin', 'eng']
-                for lang in languages_to_try:
+            all_texts = []
+
+            # Strategy 1: No preprocessing
+            if not deadline_exceeded():
+                try:
+                    text = pytesseract.image_to_string(original_image, lang='eng')
+                    if text.strip():
+                        all_texts.append(("no_preprocessing", text.strip()))
+                        successful_config = "no_preprocessing"
+                except Exception as e:
+                    logging.warning(f"Strategy 1 failed: {e}")
+
+            # Strategy 2: Light preprocessing (single pass) and two configs
+            if not text.strip() and not deadline_exceeded():
+                try:
+                    processed_image = original_image.convert('L') if original_image.mode != 'L' else original_image.copy()
+                    processed_image = processed_image.filter(ImageFilter.SHARPEN)
+                    width, height = processed_image.size
+                    if min(width, height) < 1200:
+                        scale = 1200 / min(width, height)
+                        processed_image = processed_image.resize((int(width*scale), int(height*scale)), Image.Resampling.LANCZOS)
                     for config in ['--oem 3 --psm 6', '--oem 3 --psm 11']:
+                        if deadline_exceeded():
+                            break
                         try:
-                            temp_text = pytesseract.image_to_string(test_image, lang=lang, config=config)
+                            temp_text = pytesseract.image_to_string(processed_image, lang='eng', config=config)
                             if temp_text.strip():
-                                logging.info(f"Multi-language OCR succeeded with '{lang}' and '{config}'! Extracted {len(temp_text)} characters")
-                                all_texts.append(("multilang_" + lang + "_" + config, temp_text.strip()))
-                                if not text.strip() or len(temp_text) > len(text):
+                                all_texts.append(("light_preprocessing_"+config, temp_text.strip()))
+                                if len(temp_text) > len(text):
                                     text = temp_text
-                                    successful_config = f"multilang {lang} with {config}"
-                        except Exception as e:
-                            logging.debug(f"Multi-language OCR with {lang} and {config} failed: {e}")
-            except Exception as e:
-                logging.warning(f"Strategy 4 failed: {e}")
-            
-            # Select the best result (longest text)
+                                    successful_config = f"light_preprocessing {config}"
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logging.warning(f"Strategy 2 failed: {e}")
+
             if all_texts:
-                # Sort by length and get the longest
                 all_texts.sort(key=lambda x: len(x[1]), reverse=True)
                 best_strategy, best_text = all_texts[0]
-                
                 if best_text != text:
                     text = best_text
                     successful_config = best_strategy
-                
-                logging.info(f"Best OCR result: {best_strategy} with {len(best_text)} characters")
-                logging.info(f"First 500 chars of best result: {best_text[:500]}")
-            
-            if successful_config:
-                logging.info(f"Final successful OCR config: {successful_config}")
-            else:
-                logging.warning("All OCR attempts returned empty or failed")
-            
+
             if text.strip():
-                logging.info(f"Successfully extracted text from image using Tesseract OCR. Text length: {len(text)}")
+                logging.info(f"Successfully extracted text from image. Strategy: {successful_config}, length: {len(text)}")
                 return text.strip()
             else:
-                logging.warning("Tesseract OCR returned empty text after trying all configurations.")
+                logging.warning("OCR returned empty text after limited strategies.")
                 return ""
         except Exception as e:
             logging.error(f"Tesseract OCR error: {e}", exc_info=True)
