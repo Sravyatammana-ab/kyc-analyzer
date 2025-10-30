@@ -107,6 +107,9 @@ async def analyze(file: UploadFile = File(...)):
             "analysis": analysis_result
         }
 
+    except HTTPException as http_ex:
+        # Preserve intended HTTP status codes like 400/422
+        raise http_ex
     except Exception as e:
         logging.error("An error occurred in the /analyze endpoint", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
