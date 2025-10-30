@@ -21,39 +21,46 @@ except ImportError:
 load_dotenv()
 
 # Configure Tesseract path (update this if Tesseract is installed in a different location)
-# For Windows, common path: r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# For Windows, common path: r'C:\\Program Files\\Tesseract-OCR\\tesseract.exe'
 # For Linux/Mac: pytesseract will use system PATH
 if TESSERACT_AVAILABLE:
-    # Check for Tesseract in common Windows locations
-    TESSERACT_CMD = os.getenv("TESSERACT_CMD", None)
-    
-    if not TESSERACT_CMD:
-        # Try to auto-detect Windows Tesseract installation
-        windows_paths = [
-            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-            r"C:\Users\Public\Tesseract-OCR\tesseract.exe"
-        ]
-        for path in windows_paths:
-            if os.path.exists(path):
-                TESSERACT_CMD = path
-                logging.info(f"Auto-detected Tesseract at: {path}")
-                break
-    
-    if TESSERACT_CMD:
+    # Prefer env var, then PATH (Linux/Docker), then Windows fallbacks
+    TESSERACT_CMD = os.getenv("TESSERACT_CMD")
+    if TESSERACT_CMD and os.path.exists(TESSERACT_CMD):
         pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-        
-        # Also set TESSDATA_PREFIX to find language data files
-        tessdata_dir = os.path.join(os.path.dirname(TESSERACT_CMD), 'tessdata')
-        if os.path.exists(tessdata_dir):
-            os.environ['TESSDATA_PREFIX'] = tessdata_dir
-            logging.info(f"Set TESSDATA_PREFIX to: {tessdata_dir}")
-        else:
-            logging.warning(f"Tessdata directory not found at: {tessdata_dir}")
-        
-        logging.info(f"Tesseract configured: {pytesseract.pytesseract.tesseract_cmd}")
+        logging.info(f"Using Tesseract from TESSERACT_CMD: {TESSERACT_CMD}")
     else:
-        logging.warning("Tesseract path not configured. OCR may not work.")
+        try:
+            import shutil as _sh
+            detected = _sh.which("tesseract")
+        except Exception:
+            detected = None
+        if detected:
+            pytesseract.pytesseract.tesseract_cmd = detected
+            logging.info(f"Auto-detected Tesseract on PATH: {detected}")
+        else:
+            windows_paths = [
+                r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
+                r"C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe",
+                r"C:\\Users\\Public\\Tesseract-OCR\\tesseract.exe"
+            ]
+            for path in windows_paths:
+                if os.path.exists(path):
+                    pytesseract.pytesseract.tesseract_cmd = path
+                    logging.info(f"Auto-detected Windows Tesseract at: {path}")
+                    break
+
+    # Attempt to set TESSDATA_PREFIX for common Linux/Docker paths
+    if 'TESSDATA_PREFIX' not in os.environ:
+        for candidate in [
+            '/usr/share/tesseract-ocr/4.00/tessdata',
+            '/usr/share/tesseract-ocr/tessdata'
+        ]:
+            if os.path.exists(candidate):
+                os.environ['TESSDATA_PREFIX'] = candidate
+                logging.info(f"Set TESSDATA_PREFIX to: {candidate}")
+                break
+
 
 async def extract_text_from_upload(file_path: str, file_bytes: bytes, mime_type_hint: str = None) -> str:
     """Extracts text from various formats. Uses Tesseract OCR for images and scanned documents."""
@@ -147,19 +154,28 @@ async def extract_text_from_upload(file_path: str, file_bytes: bytes, mime_type_
             
             # Ensure Tesseract path is configured
             if not hasattr(pytesseract.pytesseract, 'tesseract_cmd') or not pytesseract.pytesseract.tesseract_cmd:
-                # Try to set it again
-                TESSERACT_CMD = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-                if os.path.exists(TESSERACT_CMD):
-                    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-                    logging.info(f"Configured Tesseract path: {TESSERACT_CMD}")
-                    
-                    # Set TESSDATA_PREFIX if not already set
-                    if 'TESSDATA_PREFIX' not in os.environ:
-                        tessdata_dir = os.path.join(os.path.dirname(TESSERACT_CMD), 'tessdata')
-                        if os.path.exists(tessdata_dir):
-                            os.environ['TESSDATA_PREFIX'] = tessdata_dir
-                            logging.info(f"Set TESSDATA_PREFIX to: {tessdata_dir}")
-            
+                # Re-detect from env or PATH (Docker/Linux)
+                retry_cmd = os.getenv("TESSERACT_CMD")
+                if not retry_cmd:
+                    try:
+                        import shutil as _sh
+                        retry_cmd = _sh.which("tesseract")
+                    except Exception:
+                        retry_cmd = None
+                if retry_cmd and os.path.exists(retry_cmd):
+                    pytesseract.pytesseract.tesseract_cmd = retry_cmd
+                    logging.info(f"Configured Tesseract path: {retry_cmd}")
+                # Ensure TESSDATA_PREFIX is set if available
+                if 'TESSDATA_PREFIX' not in os.environ:
+                    for candidate in [
+                        '/usr/share/tesseract-ocr/4.00/tessdata',
+                        '/usr/share/tesseract-ocr/tessdata'
+                    ]:
+                        if os.path.exists(candidate):
+                            os.environ['TESSDATA_PREFIX'] = candidate
+                            logging.info(f"Set TESSDATA_PREFIX to: {candidate}")
+                            break
+
             image = Image.open(BytesIO(file_bytes))
             logging.info(f"Loaded image: mode={image.mode}, size={image.size}")
             
